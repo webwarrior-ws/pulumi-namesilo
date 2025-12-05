@@ -7,6 +7,7 @@ open System.Net
 open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
+open System.Web
 
 open Pulumi
 open Pulumi.Experimental
@@ -14,6 +15,8 @@ open Pulumi.Experimental.Provider
 
 type NameSiloProvider(apiKey: string) =
     inherit Pulumi.Experimental.Provider.Provider()
+
+    static let apiBaseUrl = "https://www.namesilo.com/api"
 
     let httpClient = new HttpClient()
 
@@ -35,6 +38,16 @@ type NameSiloProvider(apiKey: string) =
     interface IDisposable with
         override self.Dispose (): unit = 
             httpClient.Dispose()
+
+    member private self.RequestAsync(endpoint: string, parameters: IImmutableDictionary<string, string>) =
+        let parametersString = 
+            String.Join(
+                String.Empty,
+                parameters 
+                |> Seq.map (fun param -> $"&{HttpUtility.UrlEncode param.Key}={HttpUtility.UrlEncode param.Value}")
+            )
+        let uri = $"{apiBaseUrl}/{endpoint}?version=1&type=json&key={apiKey}{parametersString}"
+        httpClient.GetStringAsync uri |> Async.AwaitTask
     
     override self.GetSchema (request: GetSchemaRequest, ct: CancellationToken): Task<GetSchemaResponse> = 
         let schema =
@@ -58,7 +71,8 @@ type NameSiloProvider(apiKey: string) =
         Task.FromResult <| DiffResponse()
 
     override self.Configure (request: ConfigureRequest, ct: CancellationToken): Task<ConfigureResponse> = 
-        // TODO: check API key
+        if String.IsNullOrWhiteSpace apiKey then
+            failwith $"Environment variable {NameSiloProvider.ApiKeyEnvVarName} not provided."
         Task.FromResult <| ConfigureResponse()
 
     override self.Check (request: CheckRequest, ct: CancellationToken): Task<CheckResponse> = 
