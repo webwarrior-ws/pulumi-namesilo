@@ -1,10 +1,12 @@
 ﻿namespace Pulumi.NameSilo
 
 open System
+open System.Collections.Generic
 open System.Collections.Immutable
 open System.Linq
 open System.Net
 open System.Net.Http
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open System.Web
@@ -12,6 +14,10 @@ open System.Web
 open Pulumi
 open Pulumi.Experimental
 open Pulumi.Experimental.Provider
+
+type private DnsRecordOperation =
+    | Update of id: string
+    | Add
 
 type NameSiloProvider(apiKey: string) =
     inherit Pulumi.Experimental.Provider.Provider()
@@ -40,7 +46,43 @@ type NameSiloProvider(apiKey: string) =
         override self.Dispose (): unit = 
             httpClient.Dispose()
 
-    member private self.RequestAsync(endpoint: string, parameters: IImmutableDictionary<string, string>) =
+    member private self.GetDnsRecordPropertyString(dict: ImmutableDictionary<string, PropertyValue>, name: string) =
+        match dict.[name].TryGetString() with
+        | true, value -> value
+        | false, _ -> failwith $"No {name} property in {dnsRecordResourceName}"
+
+    member private self.GetDnsRecordPropertyInt(dict: ImmutableDictionary<string, PropertyValue>, name: string) =
+        match dict.[name].TryGetNumber() with
+        | true, value -> int value
+        | false, _ -> failwith $"No {name} property in {dnsRecordResourceName}"
+
+    member private self.AsyncUpdateOrCreateDnsRecord(operation: DnsRecordOperation, properties: ImmutableDictionary<string, PropertyValue>): Async<string> =
+        async {
+            let maybeId, endpoint =
+                match operation with
+                | Add -> None, "dnsAddRecord"
+                | Update(id) -> Some id, "dnsUpdateRecord"
+
+            let parameters = 
+                properties
+                |> Seq.map (fun keyValuePair -> keyValuePair.Key, keyValuePair.Value.ToString())
+                |> Map.ofSeq
+
+            let finalParameters =
+                match maybeId with
+                | Some id -> parameters |> Map.add "rrid" id
+                | None -> parameters
+
+            let! response = self.RequestAsync(endpoint, finalParameters)
+            let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                
+            if response.StatusCode <> HttpStatusCode.OK then
+                return failwith $"Namesilo server returned error ({response.StatusCode}). Response: {responseContent}"
+            else
+                return JsonDocument.Parse(responseContent).RootElement.GetProperty("reply").GetProperty("record_id").GetString()
+        }
+
+    member private self.RequestAsync(endpoint: string, parameters: Map<string, string>): Async<HttpResponseMessage> =
         let parametersString = 
             String.Join(
                 String.Empty,
@@ -48,7 +90,7 @@ type NameSiloProvider(apiKey: string) =
                 |> Seq.map (fun param -> $"&{HttpUtility.UrlEncode param.Key}={HttpUtility.UrlEncode param.Value}")
             )
         let uri = $"{apiBaseUrl}/{endpoint}?version=1&type=json&key={apiKey}{parametersString}"
-        httpClient.GetStringAsync uri |> Async.AwaitTask
+        httpClient.GetAsync uri |> Async.AwaitTask
     
     override self.GetSchema (request: GetSchemaRequest, ct: CancellationToken): Task<GetSchemaResponse> =
         let dnsRecordProperties = 
@@ -56,10 +98,6 @@ type NameSiloProvider(apiKey: string) =
                                 "domain": {
                                     "type": "string",
                                     "description": "The domain the record belongs to."
-                                },
-                                "rrid": {
-                                    "type": "string",
-                                    "description": "The unique ID of the resource record."
                                 },
                                 "rrtype": {
                                     "type": "string",
@@ -112,18 +150,26 @@ type NameSiloProvider(apiKey: string) =
         Task.FromResult <| ConfigureResponse()
 
     override self.Check (request: CheckRequest, ct: CancellationToken): Task<CheckResponse> = 
-        // TODO: implement
-        Task.FromResult <| CheckResponse(Inputs = request.NewInputs)
+        if request.Type = dnsRecordResourceName then
+            Task.FromResult <| CheckResponse(Inputs = request.NewInputs)
+        else
+            failwith $"Unknown resource type '{request.Type}'"
 
     override self.Diff (request: DiffRequest, ct: CancellationToken): Task<DiffResponse> = 
-        // TODO: check reqest type
-        let diff = request.NewInputs.Except request.OldInputs 
-        let replaces = diff |> Seq.map (fun pair -> pair.Key) |> Seq.toArray
-        Task.FromResult <| DiffResponse(Changes = (replaces.Length > 0), Replaces = replaces)
+        if request.Type = dnsRecordResourceName then
+            let diff = request.NewInputs.Except request.OldInputs 
+            let replaces = diff |> Seq.map (fun pair -> pair.Key) |> Seq.toArray
+            Task.FromResult <| DiffResponse(Changes = (replaces.Length > 0), Replaces = replaces)
+        else
+            failwith $"Unknown resource type '{request.Type}'"
 
     member private self.AsyncCreate(request: CreateRequest): Async<CreateResponse> =
         async {
-            return failwith "Not implemented"
+            if request.Type = dnsRecordResourceName then
+                let! id = self.AsyncUpdateOrCreateDnsRecord(Add, request.Properties)
+                return CreateResponse(Id = id, Properties = request.Properties)
+            else
+                return failwith $"Unknown resource type '{request.Type}'"
         }
 
     override self.Create (request: CreateRequest, ct: CancellationToken): Task<CreateResponse> = 
@@ -131,7 +177,12 @@ type NameSiloProvider(apiKey: string) =
 
     member private self.AsyncUpdate(request: UpdateRequest): Async<UpdateResponse> =
         async {
-            return failwith "Not implemented"
+            if request.Type = dnsRecordResourceName then
+                let properties = request.Olds.AddRange request.News
+                do! self.AsyncUpdateOrCreateDnsRecord(Update(request.Id), properties) |> Async.Ignore<string>
+                return UpdateResponse(Properties = properties)
+            else
+                return failwith $"Unknown resource type '{request.Type}'"
         }
 
     override self.Update (request: UpdateRequest, ct: CancellationToken): Task<UpdateResponse> = 
@@ -139,7 +190,23 @@ type NameSiloProvider(apiKey: string) =
     
     member private self.AsyncDelete(request: DeleteRequest): Async<unit> =
         async {
-            return failwith "Not implemented"
+            if request.Type = dnsRecordResourceName then
+                let domainId = self.GetDnsRecordPropertyString(request.Properties, "domainId")
+                let uri = $"{apiBaseUrl}/api/v0/domains/{domainId}/dns/records/{request.Id}"
+                let! response = httpClient.DeleteAsync(uri) |> Async.AwaitTask
+                
+                if response.StatusCode <> HttpStatusCode.OK then
+                    let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    eprintfn "Failed to delete %s with id=%s in domain with domainId=%s" request.Type request.Id domainId
+                    let errorMessage = $"SherlockDomains server returned error ({response.StatusCode}). Response: {responseContent}"
+                    if responseContent.Contains "record_id missing" then
+                        eprintfn "%s" errorMessage
+                    else
+                        failwith errorMessage
+                else
+                    ()
+            else
+                failwith $"Unknown resource type '{request.Type}'"
         }
 
     override self.Delete (request: DeleteRequest, ct: CancellationToken): Task = 
@@ -147,7 +214,34 @@ type NameSiloProvider(apiKey: string) =
 
     member private self.AsyncRead (request: ReadRequest) : Async<ReadResponse> =
         async {
-            return failwith "Not implemented"
+            if request.Type = dnsRecordResourceName then
+                let domainId = self.GetDnsRecordPropertyString(request.Properties, "domainId")
+                let! response = self.RequestAsync("dnsListRecords", Map.ofList [ "domain", domainId ])
+                
+                if response.StatusCode <> HttpStatusCode.OK then
+                    return failwith $"Namesilo server returned error (code {response.StatusCode})"
+                else
+                    let! responseJson = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    let records = JsonDocument.Parse(responseJson).RootElement.GetProperty("reply").GetProperty("resource_record")
+                    match records.EnumerateArray() |> Seq.tryFind(fun record -> record.GetProperty("record_id").GetString() = request.Id) with
+                    | Some record ->
+                        let properties = 
+                            [ for prop in record.EnumerateObject() do 
+                                  if request.Properties.ContainsKey prop.Name then
+                                      let value = 
+                                          if prop.Value.ValueKind = JsonValueKind.String then
+                                              PropertyValue(prop.Value.GetString())
+                                          elif prop.Value.ValueKind = JsonValueKind.Number then
+                                              PropertyValue(prop.Value.GetInt32())
+                                          else
+                                              failwith $"Unexpected type: {prop.Value.ValueKind}"
+                                      yield prop.Name, value ]
+                            |> dict
+                        return ReadResponse(Id = request.Id, Properties = properties)
+                    | None -> 
+                        return failwith $"Record with id={request.Id} not found"
+            else
+                return failwith $"Unknown resource type '{request.Type}'"
         }
 
     override self.Read (request: ReadRequest, ct: CancellationToken): Task<ReadResponse> = 

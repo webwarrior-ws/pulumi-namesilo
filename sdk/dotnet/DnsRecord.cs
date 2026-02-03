@@ -25,12 +25,6 @@ namespace Pulumi.Namesilo
         public Output<string?> Rrhost { get; private set; } = null!;
 
         /// <summary>
-        /// The unique ID of the resource record.
-        /// </summary>
-        [Output("rrid")]
-        public Output<string?> Rrid { get; private set; } = null!;
-
-        /// <summary>
         /// The TTL for the new record (default is 7207 if not provided)
         /// </summary>
         [Output("rrttl")]
@@ -104,12 +98,6 @@ namespace Pulumi.Namesilo
         /// </summary>
         [Input("rrhost")]
         public Input<string>? Rrhost { get; set; }
-
-        /// <summary>
-        /// The unique ID of the resource record.
-        /// </summary>
-        [Input("rrid")]
-        public Input<string>? Rrid { get; set; }
 
         /// <summary>
         /// The TTL for the new record (default is 7207 if not provided)
