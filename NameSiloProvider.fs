@@ -79,7 +79,22 @@ type NameSiloProvider(apiKey: string) =
             if response.StatusCode <> HttpStatusCode.OK then
                 return failwith $"Namesilo server returned error ({response.StatusCode}). Response: {responseContent}"
             else
-                return JsonDocument.Parse(responseContent).RootElement.GetProperty("reply").GetProperty("record_id").GetString()
+                let json = JsonDocument.Parse(responseContent).RootElement
+                match json.TryGetProperty "reply" with
+                | true, reply ->
+                    match reply.TryGetProperty "record_id" with
+                    | true, recordId ->
+                        return recordId.GetString()
+                    | false, _ ->
+                        return 
+                            failwithf 
+                                "Reply JSON does not contain 'record_id' element in 'reply' dictionary. Full reply: %s%sRequest params: %A"
+                                responseContent
+                                Environment.NewLine
+                                finalParameters
+
+                | false, _ ->
+                    return failwith "Reply JSON does not contain 'reply' element"
         }
 
     member private self.RequestAsync(endpoint: string, parameters: Map<string, string>): Async<HttpResponseMessage> =
