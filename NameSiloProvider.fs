@@ -47,14 +47,37 @@ type NameSiloProvider(apiKey: string) =
             httpClient.Dispose()
 
     member private self.GetDnsRecordPropertyString(dict: ImmutableDictionary<string, PropertyValue>, name: string) =
-        match dict.[name].TryGetString() with
-        | true, value -> value
+        match dict.TryGetValue name with
+        | true, propertyValue ->
+            match propertyValue.TryGetString() with
+            | true, value -> value
+            | false, _ -> failwith $"Value of property {name} ({propertyValue}) in {dnsRecordResourceName} is not a string"
         | false, _ -> failwith $"No {name} property in {dnsRecordResourceName}"
 
-    member private self.GetDnsRecordPropertyInt(dict: ImmutableDictionary<string, PropertyValue>, name: string) =
-        match dict.[name].TryGetNumber() with
-        | true, value -> int value
-        | false, _ -> failwith $"No {name} property in {dnsRecordResourceName}"
+    member private self.ReportErrorInResponse (responseBody: string) (errorMessage: string) =
+        failwithf
+            "%s.%sFull reply: %s"
+            errorMessage
+            Environment.NewLine
+            responseBody
+
+    /// Parse response body as JSON and get "reply" element. If repsonse code indicates error, raise an exception.
+    member private self.ParseResponseAndGetReply(responseBody: string) =
+        let json = JsonDocument.Parse(responseBody).RootElement
+        match json.TryGetProperty "reply" with
+        | true, reply ->
+            match reply.TryGetProperty "code" with
+            | true, codeElement ->
+                let code = codeElement.GetInt32()
+                if code < 300 || code >= 400 then
+                    self.ReportErrorInResponse responseBody $"Reply code does not indicate success: {code}" 
+                else
+                    reply
+            | false, _ ->
+                self.ReportErrorInResponse responseBody "Reply JSON does not contain 'code' element in 'reply' dictionary"
+
+        | false, _ ->
+            self.ReportErrorInResponse responseBody "Reply JSON does not contain 'reply' element"
 
     member private self.AsyncUpdateOrCreateDnsRecord(operation: DnsRecordOperation, properties: ImmutableDictionary<string, PropertyValue>): Async<string> =
         async {
@@ -73,31 +96,26 @@ type NameSiloProvider(apiKey: string) =
                 | Some id -> parameters |> Map.add "rrid" id
                 | None -> parameters
 
-            let! response = self.RequestAsync(endpoint, finalParameters)
+            let! response = self.AsyncRequest(endpoint, finalParameters)
             let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
                 
             if response.StatusCode <> HttpStatusCode.OK then
                 return failwith $"Namesilo server returned error ({response.StatusCode}). Response: {responseContent}"
             else
-                let json = JsonDocument.Parse(responseContent).RootElement
-                match json.TryGetProperty "reply" with
-                | true, reply ->
-                    match reply.TryGetProperty "record_id" with
-                    | true, recordId ->
-                        return recordId.GetString()
-                    | false, _ ->
-                        return 
-                            failwithf 
-                                "Reply JSON does not contain 'record_id' element in 'reply' dictionary. Full reply: %s%sRequest params: %A"
-                                responseContent
-                                Environment.NewLine
-                                finalParameters
-
+                let reply = self.ParseResponseAndGetReply responseContent
+                match reply.TryGetProperty "record_id" with
+                | true, recordId ->
+                    return recordId.GetString()
                 | false, _ ->
-                    return failwith "Reply JSON does not contain 'reply' element"
+                    return 
+                        failwithf 
+                            "Reply JSON does not contain 'record_id' element in 'reply' dictionary. Full reply: %s%sRequest params: %A"
+                            responseContent
+                            Environment.NewLine
+                            finalParameters
         }
 
-    member private self.RequestAsync(endpoint: string, parameters: Map<string, string>): Async<HttpResponseMessage> =
+    member private self.AsyncRequest(endpoint: string, parameters: Map<string, string>): Async<HttpResponseMessage> =
         let parametersString = 
             String.Join(
                 String.Empty,
@@ -206,18 +224,14 @@ type NameSiloProvider(apiKey: string) =
     member private self.AsyncDelete(request: DeleteRequest): Async<unit> =
         async {
             if request.Type = dnsRecordResourceName then
-                let domainId = self.GetDnsRecordPropertyString(request.Properties, "domainId")
-                let uri = $"{apiBaseUrl}/api/v0/domains/{domainId}/dns/records/{request.Id}"
-                let! response = httpClient.DeleteAsync(uri) |> Async.AwaitTask
+                let domain = self.GetDnsRecordPropertyString(request.Properties, "domain")
+                let rrid = request.Id
+                let! response = self.AsyncRequest("dnsDeleteRecord", Map.ofList [ "domain", domain; "rrid", rrid ])
                 
                 if response.StatusCode <> HttpStatusCode.OK then
                     let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
-                    eprintfn "Failed to delete %s with id=%s in domain with domainId=%s" request.Type request.Id domainId
-                    let errorMessage = $"SherlockDomains server returned error ({response.StatusCode}). Response: {responseContent}"
-                    if responseContent.Contains "record_id missing" then
-                        eprintfn "%s" errorMessage
-                    else
-                        failwith errorMessage
+                    eprintfn "Failed to delete %s with id=%s in domain %s" request.Type request.Id domain
+                    failwith $"Namesilo server returned error ({response.StatusCode}). Response: {responseContent}"
                 else
                     ()
             else
@@ -230,31 +244,49 @@ type NameSiloProvider(apiKey: string) =
     member private self.AsyncRead (request: ReadRequest) : Async<ReadResponse> =
         async {
             if request.Type = dnsRecordResourceName then
-                let domainId = self.GetDnsRecordPropertyString(request.Properties, "domainId")
-                let! response = self.RequestAsync("dnsListRecords", Map.ofList [ "domain", domainId ])
+                let domain = self.GetDnsRecordPropertyString(request.Properties, "domain")
+                let! response = self.AsyncRequest("dnsListRecords", Map.ofList [ "domain", domain ])
                 
                 if response.StatusCode <> HttpStatusCode.OK then
                     return failwith $"Namesilo server returned error (code {response.StatusCode})"
                 else
-                    let! responseJson = response.Content.ReadAsStringAsync() |> Async.AwaitTask
-                    let records = JsonDocument.Parse(responseJson).RootElement.GetProperty("reply").GetProperty("resource_record")
-                    match records.EnumerateArray() |> Seq.tryFind(fun record -> record.GetProperty("record_id").GetString() = request.Id) with
-                    | Some record ->
-                        let properties = 
-                            [ for prop in record.EnumerateObject() do 
-                                  if request.Properties.ContainsKey prop.Name then
-                                      let value = 
-                                          if prop.Value.ValueKind = JsonValueKind.String then
-                                              PropertyValue(prop.Value.GetString())
-                                          elif prop.Value.ValueKind = JsonValueKind.Number then
-                                              PropertyValue(prop.Value.GetInt32())
-                                          else
-                                              failwith $"Unexpected type: {prop.Value.ValueKind}"
-                                      yield prop.Name, value ]
-                            |> dict
-                        return ReadResponse(Id = request.Id, Properties = properties)
-                    | None -> 
-                        return failwith $"Record with id={request.Id} not found"
+                    let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    let reply = self.ParseResponseAndGetReply responseBody
+                    match reply.TryGetProperty "resource_record" with
+                    | true, records ->
+                        let maybeRecord = 
+                            records.EnumerateArray()
+                            |> Seq.tryFind
+                                (fun record -> 
+                                    match record.TryGetProperty "record_id" with
+                                    | true, recordId -> recordId.GetString() = request.Id
+                                    | false, _ ->
+                                        self.ReportErrorInResponse
+                                            responseBody
+                                            "Could not get 'record_id' property in element of 'resource_record' array")
+
+                        match maybeRecord with
+                        | Some record ->
+                            let properties = 
+                                [ for prop in record.EnumerateObject() do 
+                                      if request.Properties.ContainsKey prop.Name then
+                                          let value = 
+                                              if prop.Value.ValueKind = JsonValueKind.String then
+                                                  PropertyValue(prop.Value.GetString())
+                                              elif prop.Value.ValueKind = JsonValueKind.Number then
+                                                  PropertyValue(prop.Value.GetInt32())
+                                              else
+                                                  failwith $"Unexpected type: {prop.Value.ValueKind}"
+                                          yield prop.Name, value ]
+                                |> dict
+                            return ReadResponse(Id = request.Id, Properties = properties)
+                        | None -> 
+                            return failwith $"Record with id={request.Id} not found"
+                    | false, _ ->
+                        return
+                            self.ReportErrorInResponse
+                                responseBody
+                                "Could not get 'resource_record' in reply dict while getting list of DNS records"
             else
                 return failwith $"Unknown resource type '{request.Type}'"
         }
