@@ -23,6 +23,7 @@ type NameSiloProvider(apiKey: string) =
     inherit Pulumi.Experimental.Provider.Provider()
 
     static let dnsRecordResourceName = "namesilo:index:DnsRecord"
+    static let nameserversResourceName = "namesilo:index:Nameservers"
     static let apiBaseUrl = "https://www.namesilo.com/api"
 
     let httpClient = new HttpClient()
@@ -46,13 +47,16 @@ type NameSiloProvider(apiKey: string) =
         override self.Dispose (): unit = 
             httpClient.Dispose()
 
-    member private self.GetDnsRecordPropertyString(dict: ImmutableDictionary<string, PropertyValue>, name: string) =
+    member private self.GetPropertyString (resourceName: string) (dict: ImmutableDictionary<string, PropertyValue>) (name: string) =
         match dict.TryGetValue name with
         | true, propertyValue ->
             match propertyValue.TryGetString() with
             | true, value -> value
-            | false, _ -> failwith $"Value of property {name} ({propertyValue}) in {dnsRecordResourceName} is not a string"
-        | false, _ -> failwith $"No {name} property in {dnsRecordResourceName}"
+            | false, _ -> failwith $"Value of property {name} ({propertyValue}) in {resourceName} is not a string"
+        | false, _ -> failwith $"No {name} property in {resourceName}"
+
+    member private self.GetDnsRecordPropertyString(dict: ImmutableDictionary<string, PropertyValue>, name: string) =
+        self.GetPropertyString dnsRecordResourceName dict name
 
     member private self.ReportErrorInResponse (responseBody: string) (errorMessage: string) =
         failwithf
@@ -115,6 +119,24 @@ type NameSiloProvider(apiKey: string) =
                             finalParameters
         }
 
+    member private self.AsyncChangeNameservers (domain: string) (ns1: string) (ns2: string): Async<unit> =
+        async {
+            let parameters = 
+                Map.ofList
+                    [
+                        "domain", domain
+                        "ns1", ns1
+                        "ns2", ns2
+                    ]
+            let! response = self.AsyncRequest("changeNameServers", parameters)
+            let! responseContent = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                
+            if response.StatusCode <> HttpStatusCode.OK then
+                return failwith $"Namesilo server returned error ({response.StatusCode}). Response: {responseContent}"
+            else
+                ignore <| self.ParseResponseAndGetReply responseContent
+        }
+
     member private self.AsyncRequest(endpoint: string, parameters: Map<string, string>): Async<HttpResponseMessage> =
         let parametersString = 
             String.Join(
@@ -150,6 +172,22 @@ type NameSiloProvider(apiKey: string) =
                                 }
                             }"""
 
+        let nameserversProperties = 
+            """{
+                                "domain": {
+                                    "type": "string",
+                                    "description": "The domain the nameservers are associated with."
+                                },
+                                "ns1": {
+                                    "type": "string",
+                                    "description": "Nameserver 1"
+                                },
+                                "ns2": {
+                                    "type": "string",
+                                    "description": "Nameserver 2"
+                                }
+                            }"""
+
         let schema =
             sprintf
                 """{
@@ -159,6 +197,11 @@ type NameSiloProvider(apiKey: string) =
                         "%s" : {
                             "properties": %s,
                             "inputProperties": %s
+                        },
+                        "%s" : {
+                            "properties": %s,
+                            "inputProperties": %s,
+                            "requiredInputs": [ "domain", "ns1", "ns2" ]
                         }
                     },
                     "provider": {
@@ -168,6 +211,9 @@ type NameSiloProvider(apiKey: string) =
                 dnsRecordResourceName
                 dnsRecordProperties
                 dnsRecordProperties
+                nameserversResourceName
+                nameserversProperties
+                nameserversProperties
         
         Task.FromResult <| GetSchemaResponse(Schema = schema)
 
@@ -183,13 +229,13 @@ type NameSiloProvider(apiKey: string) =
         Task.FromResult <| ConfigureResponse()
 
     override self.Check (request: CheckRequest, ct: CancellationToken): Task<CheckResponse> = 
-        if request.Type = dnsRecordResourceName then
+        if request.Type = dnsRecordResourceName || request.Type = nameserversResourceName  then
             Task.FromResult <| CheckResponse(Inputs = request.NewInputs)
         else
             failwith $"Unknown resource type '{request.Type}'"
 
     override self.Diff (request: DiffRequest, ct: CancellationToken): Task<DiffResponse> = 
-        if request.Type = dnsRecordResourceName then
+        if request.Type = dnsRecordResourceName || request.Type = nameserversResourceName then
             let diff = request.NewInputs.Except request.OldInputs 
             let replaces = diff |> Seq.map (fun pair -> pair.Key) |> Seq.toArray
             Task.FromResult <| DiffResponse(Changes = (replaces.Length > 0), Replaces = replaces)
@@ -201,6 +247,12 @@ type NameSiloProvider(apiKey: string) =
             if request.Type = dnsRecordResourceName then
                 let! id = self.AsyncUpdateOrCreateDnsRecord(Add, request.Properties)
                 return CreateResponse(Id = id, Properties = request.Properties)
+            elif request.Type = nameserversResourceName then
+                let domain = self.GetPropertyString nameserversResourceName request.Properties "domain"
+                let ns1 = self.GetPropertyString nameserversResourceName request.Properties "ns1"
+                let ns2 = self.GetPropertyString nameserversResourceName request.Properties "ns2"
+                do! self.AsyncChangeNameservers domain ns1 ns2
+                return CreateResponse(Properties = request.Properties)
             else
                 return failwith $"Unknown resource type '{request.Type}'"
         }
@@ -213,6 +265,15 @@ type NameSiloProvider(apiKey: string) =
             if request.Type = dnsRecordResourceName then
                 let properties = request.Olds.AddRange request.News
                 do! self.AsyncUpdateOrCreateDnsRecord(Update(request.Id), properties) |> Async.Ignore<string>
+                return UpdateResponse(Properties = properties)
+            elif request.Type = nameserversResourceName then
+                if request.Olds.["domain"] <> request.News.["domain"] then
+                    failwith $"Cannot update 'domain' property of resource {nameserversResourceName}. Instead destroy old resource and create a new one."
+                let properties = request.Olds.AddRange request.News
+                let domain = self.GetPropertyString nameserversResourceName properties "domain"
+                let ns1 = self.GetPropertyString nameserversResourceName properties "ns1"
+                let ns2 = self.GetPropertyString nameserversResourceName properties "ns2"
+                do! self.AsyncChangeNameservers domain ns1 ns2
                 return UpdateResponse(Properties = properties)
             else
                 return failwith $"Unknown resource type '{request.Type}'"
@@ -234,6 +295,9 @@ type NameSiloProvider(apiKey: string) =
                     failwith $"Namesilo server returned error ({response.StatusCode}). Response: {responseContent}"
                 else
                     ()
+            elif request.Type = nameserversResourceName then
+                let domain = self.GetPropertyString nameserversResourceName request.Properties "domain"
+                do! self.AsyncChangeNameservers domain "ns1.namesilo.com" "ns2.namesilo.com"
             else
                 failwith $"Unknown resource type '{request.Type}'"
         }
@@ -287,6 +351,35 @@ type NameSiloProvider(apiKey: string) =
                             self.ReportErrorInResponse
                                 responseBody
                                 "Could not get 'resource_record' in reply dict while getting list of DNS records"
+            elif request.Type = nameserversResourceName then
+                let domain = self.GetPropertyString nameserversResourceName request.Properties "domain"
+                let! response = self.AsyncRequest("getDomainInfo", Map.ofList [ "domain", domain ])
+                
+                if response.StatusCode <> HttpStatusCode.OK then
+                    return failwith $"Namesilo server returned error (code {response.StatusCode})"
+                else
+                    let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    let reply = self.ParseResponseAndGetReply responseBody
+                    match reply.TryGetProperty "nameservers" with
+                    | true, nameservers ->
+                        let nameservers =
+                            nameservers.EnumerateArray()
+                            |> Seq.sortBy (fun nsRecord -> nsRecord.GetProperty("position").GetInt32())
+                            |> Seq.take 2
+                            |> Seq.map (fun nsRecord -> nsRecord.GetProperty("nameserver").GetString())
+                            |> Seq.toList
+                        let properties = 
+                            dict [ 
+                                "domain", PropertyValue domain
+                                "ns1", PropertyValue nameservers.[0]
+                                "ns2", PropertyValue nameservers.[1]
+                            ]
+                        return ReadResponse(Id = request.Id, Properties = properties)
+                    | false, _ ->
+                        return
+                            self.ReportErrorInResponse
+                                responseBody
+                                "Could not get 'nameservers' in reply dict while getting list of DNS records"
             else
                 return failwith $"Unknown resource type '{request.Type}'"
         }
