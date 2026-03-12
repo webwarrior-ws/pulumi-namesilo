@@ -349,17 +349,12 @@ type NameSiloProvider(apiKey: string) =
                         match maybeRecord with
                         | Some record ->
                             let properties = 
-                                [ for prop in record.EnumerateObject() do 
-                                      if request.Properties.ContainsKey prop.Name then
-                                          let value = 
-                                              if prop.Value.ValueKind = JsonValueKind.String then
-                                                  PropertyValue(prop.Value.GetString())
-                                              elif prop.Value.ValueKind = JsonValueKind.Number then
-                                                  PropertyValue(prop.Value.GetInt32())
-                                              else
-                                                  failwith $"Unexpected type: {prop.Value.ValueKind}"
-                                          yield prop.Name, value ]
-                                |> dict
+                                dict [ 
+                                    "rrtype", record.GetProperty("type").GetString() |> PropertyValue
+                                    "rrhost", record.GetProperty("host").GetString() |> PropertyValue
+                                    "rrvalue", record.GetProperty("value").GetString() |> PropertyValue
+                                    "rrttl", record.GetProperty("ttl").GetInt32() |> PropertyValue
+                                ]
                             return ReadResponse(Id = request.Id, Properties = properties)
                         | None -> 
                             return failwith $"Record with id={request.Id} not found"
