@@ -74,7 +74,10 @@ type NameSiloProvider(apiKey: string) =
         | true, reply ->
             match reply.TryGetProperty "code" with
             | true, codeElement ->
-                let code = codeElement.GetInt32()
+                let code = 
+                    match codeElement.TryGetInt32() with
+                    | true, number -> number
+                    | false, _ -> codeElement.ToString() |> int
                 if code < 300 || code >= 400 then
                     self.ReportErrorInResponse responseBody $"Reply code does not indicate success: {code}" 
                 else
