@@ -111,7 +111,7 @@ type NameSiloProvider(apiKey: string) =
                 let reply = self.ParseResponseAndGetReply responseContent
                 match reply.TryGetProperty "record_id" with
                 | true, recordId ->
-                    return recordId.GetString()
+                    return recordId.ToString()
                 | false, _ ->
                     return 
                         failwithf 
