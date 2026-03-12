@@ -74,7 +74,10 @@ type NameSiloProvider(apiKey: string) =
         | true, reply ->
             match reply.TryGetProperty "code" with
             | true, codeElement ->
-                let code = codeElement.GetInt32()
+                let code = 
+                    match codeElement.TryGetInt32() with
+                    | true, number -> number
+                    | false, _ -> codeElement.ToString() |> int
                 if code < 300 || code >= 400 then
                     self.ReportErrorInResponse responseBody $"Reply code does not indicate success: {code}" 
                 else
@@ -111,7 +114,7 @@ type NameSiloProvider(apiKey: string) =
                 let reply = self.ParseResponseAndGetReply responseContent
                 match reply.TryGetProperty "record_id" with
                 | true, recordId ->
-                    return recordId.GetString()
+                    return recordId.ToString()
                 | false, _ ->
                     return 
                         failwithf 
@@ -349,17 +352,12 @@ type NameSiloProvider(apiKey: string) =
                         match maybeRecord with
                         | Some record ->
                             let properties = 
-                                [ for prop in record.EnumerateObject() do 
-                                      if request.Properties.ContainsKey prop.Name then
-                                          let value = 
-                                              if prop.Value.ValueKind = JsonValueKind.String then
-                                                  PropertyValue(prop.Value.GetString())
-                                              elif prop.Value.ValueKind = JsonValueKind.Number then
-                                                  PropertyValue(prop.Value.GetInt32())
-                                              else
-                                                  failwith $"Unexpected type: {prop.Value.ValueKind}"
-                                          yield prop.Name, value ]
-                                |> dict
+                                dict [ 
+                                    "rrtype", record.GetProperty("type").GetString() |> PropertyValue
+                                    "rrhost", record.GetProperty("host").GetString() |> PropertyValue
+                                    "rrvalue", record.GetProperty("value").GetString() |> PropertyValue
+                                    "rrttl", record.GetProperty("ttl").GetInt32() |> PropertyValue
+                                ]
                             return ReadResponse(Id = request.Id, Properties = properties)
                         | None -> 
                             return failwith $"Record with id={request.Id} not found"
